@@ -1,0 +1,4 @@
+# local settings with real share names/IPs
+map-drive.conf
+*.local
+.env

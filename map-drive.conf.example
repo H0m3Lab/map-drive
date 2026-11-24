@@ -1,0 +1,14 @@
+# Optional settings for map-drive. Copy to /etc/map-drive.conf and edit.
+# Lines are bash: KEY="value"
+
+# Letter used when you run map-drive with no arguments.
+DEFAULT_LETTER="Z"
+
+# Share offered when you run map-drive with no arguments (press Enter to accept it).
+# Use \\server\share or //server/share. Empty = always ask.
+DEFAULT_SHARE="//192.0.2.10/MyFiles"
+
+# Extra mount.cifs options added to every new mapping.
+# uid, gid, file_mode, dir_mode and credentials are set by map-drive itself.
+# Examples: add "vers=3.0" for an old NAS, or "cache=none".
+MOUNT_OPTIONS="iocharset=utf8,soft"

@@ -1,0 +1,242 @@
+#!/bin/bash
+# map-drive - "Map network drive" for Linux: connect an SMB/CIFS (Windows/NAS) share
+# by its UNC path, reconnect it after every boot, and show it in the file manager sidebar.
+#
+#   map-drive                          ask for the share (or use DEFAULT_SHARE) as drive Z
+#   map-drive Y '\\server\share'       drive letter Y, that share (\\server\share or //server/share)
+#   map-drive --list                   show mapped drives
+#   map-drive --remove Y               disconnect and forget drive Y
+#   map-drive --version
+#
+# The share is mounted at /mnt/<letter> by a systemd .mount + .automount pair (it connects the
+# first time it is opened, so boot never waits for the network). The NAS password is stored only
+# in /etc/cifs-credentials/<letter>, readable by root alone. Needs: bash, systemd, sudo, python3,
+# mount.cifs (cifs-utils). Optional settings: /etc/map-drive.conf (see map-drive.conf.example).
+
+VERSION="0.1.0"
+
+set -u
+CONF=${MAP_DRIVE_CONF:-/etc/map-drive.conf}
+CRED_DIR=/etc/cifs-credentials
+UNIT_DIR=/etc/systemd/system
+PLACES=${MAP_DRIVE_PLACES:-$HOME/.local/share/user-places.xbel}      # KDE (Dolphin, file dialogs)
+GTK_BOOKMARKS=${MAP_DRIVE_GTK:-$HOME/.config/gtk-3.0/bookmarks}       # GTK (Nautilus, Nemo, Thunar, dialogs)
+DEFAULT_LETTER=Z
+DEFAULT_SHARE=""
+MOUNT_OPTIONS="iocharset=utf8,soft"
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+
+say() { printf '\033[1;32m%s\033[0m\n' "$*"; }
+err() { printf '\033[1;31m%s\033[0m\n' "$*" >&2; }
+
+# "Z", "z:", " z " -> "z"; anything else -> empty
+norm_letter() {
+  local l
+  l=$(printf '%s' "$1" | tr -d ': ' | tr 'A-Z' 'a-z')
+  [[ "$l" =~ ^[a-z]$ ]] && printf '%s' "$l"
+}
+
+# \\server\share\sub, //server/share/ -> //server/share/sub; invalid -> empty
+norm_share() {
+  local s
+  s=$(printf '%s' "$1" | tr '\\' '/')
+  s=${s%/}
+  [[ "$s" =~ ^//[^/[:space:]]+/[^/].* ]] && printf '%s' "$s"
+}
+
+# //server/share/sub -> \\server\share\sub (for display)
+unc() { printf '%s' "$1" | tr '/' '\\'; }
+
+places_add() {   # places_add <letter> <title>
+  local href="file:///mnt/$1" title=$2
+  mkdir -p "$(dirname "$PLACES")"
+  if [ ! -f "$PLACES" ]; then
+    cat > "$PLACES" <<'X'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE xbel>
+<xbel xmlns:bookmark="http://www.freedesktop.org/standards/desktop-bookmarks" xmlns:kdepriv="http://www.kde.org/kdepriv" xmlns:mime="http://www.freedesktop.org/standards/shared-mime-info">
+</xbel>
+X
+  fi
+  if ! grep -q "href=\"$href\"" "$PLACES"; then
+    cp -p "$PLACES" "$PLACES.bak-map-drive" 2>/dev/null
+    python3 - "$PLACES" "$href" "$title" <<'PY' || return 1
+import sys
+from xml.sax.saxutils import escape
+path, href, title = sys.argv[1:4]
+s = open(path, encoding="utf-8").read()
+entry = (' <bookmark href="%s">\n  <title>%s</title>\n  <info>\n'
+         '   <metadata owner="http://freedesktop.org">\n'
+         '    <bookmark:icon name="folder-network"/>\n   </metadata>\n'
+         '  </info>\n </bookmark>\n') % (escape(href, {'"': '&quot;'}), escape(title))
+i = s.rfind("</xbel>")
+if i < 0:
+    sys.exit("map-drive: %s looks broken; not changed" % path)
+open(path, "w", encoding="utf-8").write(s[:i] + entry + s[i:])
+PY
+  fi
+  mkdir -p "$(dirname "$GTK_BOOKMARKS")"
+  touch "$GTK_BOOKMARKS"
+  grep -q "^$href " "$GTK_BOOKMARKS" || printf '%s %s\n' "$href" "$title" >> "$GTK_BOOKMARKS"
+}
+
+places_remove() {   # places_remove <letter>
+  local href="file:///mnt/$1"
+  if [ -f "$PLACES" ]; then
+    python3 - "$PLACES" "$href" <<'PY'
+import sys, re
+path, href = sys.argv[1], sys.argv[2]
+s = open(path, encoding="utf-8").read()
+s2 = re.sub(r'\n?[ \t]*<bookmark href="' + re.escape(href) + r'">.*?</bookmark>', '', s, flags=re.S)
+if s2 != s:
+    open(path, "w", encoding="utf-8").write(s2)
+PY
+  fi
+  if [ -f "$GTK_BOOKMARKS" ]; then
+    grep -v "^$href " "$GTK_BOOKMARKS" > "$GTK_BOOKMARKS.tmp" || true
+    mv "$GTK_BOOKMARKS.tmp" "$GTK_BOOKMARKS"
+  fi
+}
+
+do_list() {
+  local f l what st found=0
+  for f in "$UNIT_DIR"/mnt-?.mount; do
+    [ -e "$f" ] || continue
+    grep -q '^# Created by map-drive' "$f" || continue
+    found=1
+    l=$(basename "$f" .mount); l=${l#mnt-}
+    what=$(sed -n 's/^What=//p' "$f")
+    if systemctl is-active --quiet "mnt-$l.mount"; then st="connected"
+    elif systemctl is-active --quiet "mnt-$l.automount"; then st="connects when opened"
+    else st="OFF: sudo systemctl enable --now mnt-$l.automount"; fi
+    printf '  %s:  %-40s /mnt/%s  (%s)\n' "${l^^}" "$(unc "$what")" "$l" "$st"
+  done
+  [ $found = 1 ] || echo "  No mapped drives."
+}
+
+do_remove() {
+  local l u
+  l=$(norm_letter "${1:-}") || true
+  [ -n "$l" ] || { err "Usage: map-drive --remove <letter>"; return 1; }
+  u="mnt-$l"
+  if [ ! -e "$UNIT_DIR/$u.mount" ]; then err "Drive ${l^^}: is not mapped."; return 1; fi
+  grep -q '^# Created by map-drive' "$UNIT_DIR/$u.mount" || { err "/mnt/$l was not set up by map-drive; not touching it."; return 1; }
+  sudo systemctl disable --now "$u.automount" 2>/dev/null
+  sudo systemctl stop "$u.mount" 2>/dev/null
+  sudo rm -f "$UNIT_DIR/$u.mount" "$UNIT_DIR/$u.automount" "$CRED_DIR/$l"
+  sudo systemctl daemon-reload
+  sudo rmdir "/mnt/$l" 2>/dev/null
+  places_remove "$l"
+  say "Drive ${l^^}: removed."
+}
+
+do_map() {
+  local l share u nuser npass tmp name uidn gidn
+  command -v mount.cifs >/dev/null 2>&1 || [ -x /usr/sbin/mount.cifs ] || [ -x /sbin/mount.cifs ] || {
+    err "mount.cifs not found. Install cifs-utils first (Gentoo: emerge net-fs/cifs-utils)."; return 1; }
+  l=$(norm_letter "${1:-$DEFAULT_LETTER}") || true
+  [ -n "$l" ] || { err "Drive letter must be a single letter, e.g. Z"; return 1; }
+  share=${2:-}
+  if [ -z "$share" ]; then
+    if [ -n "$DEFAULT_SHARE" ]; then
+      read -r -p "Share to map as ${l^^}: [$(unc "$DEFAULT_SHARE")]: " share
+      share=${share:-$DEFAULT_SHARE}
+    else
+      read -r -p "Share to map as ${l^^}: (like \\\\server\\share): " share
+    fi
+  fi
+  share=$(norm_share "$share") || true
+  [ -n "$share" ] || { err "Share must look like \\\\server\\share or //server/share"; return 1; }
+  u="mnt-$l"
+  if [ -e "$UNIT_DIR/$u.mount" ]; then
+    err "Drive ${l^^}: is already mapped. Remove it first:  map-drive --remove ${l^^}"; return 1
+  fi
+  if mountpoint -q "/mnt/$l" 2>/dev/null; then
+    err "/mnt/$l is already in use by something else."; return 1
+  fi
+
+  echo "Mapping ${l^^}: -> $(unc "$share")"
+  read -r -p "Username on the server: " nuser
+  [ -n "$nuser" ] || { err "Username is required."; return 1; }
+  read -r -s -p "Password (hidden): " npass; echo
+  echo "(Next prompt, if any, is YOUR computer password for sudo.)"
+  sudo -v || return 1
+
+  tmp=$(mktemp) && chmod 600 "$tmp"
+  printf 'username=%s\npassword=%s\n' "$nuser" "$npass" > "$tmp"
+  npass=""
+  sudo install -d -m 700 -o root -g root "$CRED_DIR"
+  sudo install -m 600 -o root -g root "$tmp" "$CRED_DIR/$l"
+  rm -f "$tmp"
+
+  uidn=$(id -u); gidn=$(id -g)
+  sudo install -d -m 755 "/mnt/$l"
+  sudo tee "$UNIT_DIR/$u.mount" >/dev/null <<EOF
+# Created by map-drive: drive ${l^^}: = $(unc "$share")
+[Unit]
+Description=Network drive ${l^^}: ($(unc "$share"))
+Wants=network-online.target
+After=network-online.target
+
+[Mount]
+What=$share
+Where=/mnt/$l
+Type=cifs
+Options=credentials=$CRED_DIR/$l,uid=$uidn,gid=$gidn,file_mode=0644,dir_mode=0755,$MOUNT_OPTIONS
+TimeoutSec=30
+EOF
+  sudo tee "$UNIT_DIR/$u.automount" >/dev/null <<EOF
+# Created by map-drive: connects drive ${l^^}: the first time it is opened
+[Unit]
+Description=Network drive ${l^^}: (on demand)
+
+[Automount]
+Where=/mnt/$l
+TimeoutIdleSec=0
+
+[Install]
+WantedBy=remote-fs.target
+EOF
+  sudo systemctl daemon-reload
+  if ! sudo systemctl start "$u.mount"; then
+    err "Could not connect to $(unc "$share"). Reason:"
+    sudo journalctl -u "$u.mount" -n 6 --no-pager -o cat | grep -v '^$' >&2
+    err "Nothing was kept. Check the share name, username and password, then try again."
+    sudo rm -f "$UNIT_DIR/$u.mount" "$UNIT_DIR/$u.automount" "$CRED_DIR/$l"
+    sudo systemctl daemon-reload; sudo rmdir "/mnt/$l" 2>/dev/null
+    return 1
+  fi
+  # The test mount worked. Hand the path over to the automount (it refuses to start on a path
+  # that is already mounted), then open it once so the drive is connected right away.
+  sudo systemctl stop "$u.mount"
+  if ! sudo systemctl enable --now "$u.automount" >/dev/null 2>&1; then
+    err "Connected, but could not turn on reconnect-at-boot. See: journalctl -u $u.automount"
+  fi
+  ls "/mnt/$l" >/dev/null 2>&1
+
+  name=${share##*/}
+  places_add "$l" "${l^^} ($name)"
+  say "Drive ${l^^}: connected: $(unc "$share") is at /mnt/$l"
+  echo "It is in your file manager's sidebar as \"${l^^} ($name)\" (reopen the file manager if it was open)."
+  echo "It reconnects by itself after every restart."
+}
+
+main() {
+  if [ "$(id -u)" -eq 0 ]; then
+    err "Run map-drive as yourself, not as root (it asks for sudo when needed)."; return 1
+  fi
+  case "${1:-}" in
+    --list|-l)    do_list ;;
+    --remove|-r)  do_remove "${2:-}" ;;
+    --version|-V) echo "map-drive $VERSION" ;;
+    -h|--help)    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+    -*)           err "Unknown option: $1 (see map-drive --help)"; return 1 ;;
+    *)            do_map "${1:-}" "${2:-}" ;;
+  esac
+}
+
+# Run only when executed, not when sourced by the tests.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

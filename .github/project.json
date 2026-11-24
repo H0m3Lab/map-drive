@@ -1,0 +1,20 @@
+{
+  "name": "map-drive",
+  "slug": "map-drive",
+  "tagline": "\"Map network drive\" for Linux: one small script, no Samba suite.",
+  "description": "Connects a Windows or NAS share by its UNC path to a drive letter, reconnects it after every restart with a systemd automount, and adds it to the KDE and GTK file manager sidebars. Needs only cifs-utils.",
+  "status": "early",
+  "features": [
+    "Map \\\\server\\share to a drive letter in one command",
+    "Reconnects on demand after every boot, never blocks startup",
+    "Password in a root-only file, never on a command line",
+    "Sidebar entry in Dolphin, KDE dialogs and GTK file managers",
+    "Rolls back everything if the first connection fails"
+  ],
+  "stack": ["Bash", "systemd", "cifs-utils"],
+  "repository": "https://github.com/H0m3Lab/map-drive",
+  "documentation": "https://github.com/H0m3Lab/map-drive#readme",
+  "changelog": "https://github.com/H0m3Lab/map-drive/blob/main/CHANGELOG.md",
+  "license": "MIT",
+  "screenshots": []
+}
