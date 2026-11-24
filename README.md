@@ -7,8 +7,11 @@ file manager's sidebar as a drive letter, the way Windows does.
 ```
 $ map-drive Z '\\nas\MyFiles'
 Mapping Z: -> \\nas\MyFiles
-Username on the server: alice
-Password (hidden):
+Step 1 of 2: this computer needs admin rights to set up the drive.
+  YOUR COMPUTER password (for alice):
+Step 2 of 2: sign in to \\nas (the NAS/server account).
+  Server username: alice
+  Server password (hidden):
 Drive Z: connected: \\nas\MyFiles is at /mnt/z
 It is in your file manager's sidebar as "Z (MyFiles)" (reopen the file manager if it was open).
 It reconnects by itself after every restart.
@@ -81,6 +84,11 @@ Optional file `/etc/map-drive.conf` (start from `map-drive.conf.example`):
 To change the password of a mapped drive, remove it and map it again.
 
 ## Troubleshooting
+
+- **"That computer password was not accepted"**: step 1 wants the password of your Linux account,
+  not the server's. Many distributions lock the account for a few minutes after 3 wrong tries
+  (`pam_faillock`); during that time even the right password fails. Wait, or as root run
+  `faillock --user <you> --reset`.
 
 - **"Could not connect ... Permission denied"**: wrong username or password, or the account has no
   access to that share. Nothing is kept; run map-drive again.

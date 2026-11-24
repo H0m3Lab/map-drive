@@ -13,7 +13,7 @@
 # in /etc/cifs-credentials/<letter>, readable by root alone. Needs: bash, systemd, sudo, python3,
 # mount.cifs (cifs-utils). Optional settings: /etc/map-drive.conf (see map-drive.conf.example).
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 set -u
 CONF=${MAP_DRIVE_CONF:-/etc/map-drive.conf}
@@ -157,11 +157,19 @@ do_map() {
   fi
 
   echo "Mapping ${l^^}: -> $(unc "$share")"
-  read -r -p "Username on the server: " nuser
+  # Computer password first (sudo), so it can't be mixed up with the server password.
+  if ! sudo -n true 2>/dev/null; then
+    echo "Step 1 of 2: this computer needs admin rights to set up the drive."
+    if ! sudo -v -p "  YOUR COMPUTER password (for $(id -un)): "; then
+      err "That computer password was not accepted. After 3 wrong tries this PC locks the account"
+      err "for a few minutes, and even the right password is refused until then."
+      return 1
+    fi
+  fi
+  echo "Step 2 of 2: sign in to $(unc "${share%/*}") (the NAS/server account)."
+  IFS= read -r -p "  Server username: " nuser
   [ -n "$nuser" ] || { err "Username is required."; return 1; }
-  read -r -s -p "Password (hidden): " npass; echo
-  echo "(Next prompt, if any, is YOUR computer password for sudo.)"
-  sudo -v || return 1
+  IFS= read -r -s -p "  Server password (hidden): " npass; echo
 
   tmp=$(mktemp) && chmod 600 "$tmp"
   printf 'username=%s\npassword=%s\n' "$nuser" "$npass" > "$tmp"
